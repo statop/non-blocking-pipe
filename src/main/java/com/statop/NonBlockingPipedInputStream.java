@@ -18,9 +18,21 @@ import java.util.concurrent.atomic.AtomicLong;
 public class NonBlockingPipedInputStream extends InputStream {
     private static final int DEFAULT_BUFFER_SIZE = 16384;
 
-    //we can use a normal byte array as long as only one thread at a time is accessing a given part of the array,
+    //we can use a normal byte array and write to portions of it in separate threads as long as only one thread at a time is accessing a given part of the array,
     //ie, the java spec explicitly prohibits "word-tearing", see http://docs.oracle.com/javase/specs/jls/se7/html/jls-17.html#jls-17.6
-    private final byte[] buf;
+
+    //every time we pass data from on thread to the other, we do buf = bufRef2, which will force the data in the buffer
+    //to be visible in the other thread
+
+    //ie writing to the buffer in one thread might not make the content visible in the other thread
+    //without doing the volatile write of the reference to the buffer
+
+    //this does not imply that the _contents_ of the buffer is volatile, just that the reference is volatile and we have a way to force
+    //content to be visible in a separate thread without a lock
+
+    private volatile byte[] buf;
+    private final byte[] bufRef2;
+
 
     //we use two "pipes", one to send "sectors" of the buffer to the read thread for reading
     private final Pipe read;
@@ -46,9 +58,11 @@ public class NonBlockingPipedInputStream extends InputStream {
             throw new IllegalArgumentException("bufferSize must be > 0, it was " + bufferSize);
         }
         buf = new byte[bufferSize];
-        read = new Pipe(bufferSize);
+        bufRef2 = buf;
+        read = new Pipe(bufferSize, this);
         write = read.opposite;
-        write.spaceEnd += bufferSize;
+        write.spaceEnd.set(write.spaceEnd.get() + bufferSize);
+        read.oppositeSpaceEnd = write.spaceEnd.get();
         out = new NonBlockingPipedOutputStream(this);
     }
 
@@ -98,6 +112,8 @@ public class NonBlockingPipedInputStream extends InputStream {
         int copied = 0;
         int toCopy;
 
+        byte[] bufRef = buf;
+
         do {
             if (!read.fetch()) {
                 return -1;
@@ -105,7 +121,7 @@ public class NonBlockingPipedInputStream extends InputStream {
 
             toCopy = Math.min(remaining, read.end - read.cur);
 
-            System.arraycopy(buf, read.cur, buffer, offset + copied, toCopy);
+            System.arraycopy(bufRef, read.cur, buffer, offset + copied, toCopy);
 
             read.cur += toCopy;
 
@@ -114,7 +130,7 @@ public class NonBlockingPipedInputStream extends InputStream {
             copied += toCopy;
             remaining -= toCopy;
 
-        } while ((remaining > 0) && (read.spaceEnd != read.spaceStart));
+        } while ((remaining > 0) && (read.spaceEnd.get() != read.spaceStart));
 
         return copied;
     }
@@ -122,7 +138,7 @@ public class NonBlockingPipedInputStream extends InputStream {
     @Override
     public int available() throws IOException {
         assertOpen(true);
-        long available = read.spaceEnd - read.spaceStart;
+        long available = read.spaceEnd.get() - read.spaceStart;
         return (available > ((long) Integer.MAX_VALUE)) ? Integer.MAX_VALUE : (int) available;
     }
 
@@ -151,6 +167,7 @@ public class NonBlockingPipedInputStream extends InputStream {
         }
 
         int toCopy;
+        byte[] bufRef = buf;
 
         while (remaining > 0) {
 
@@ -161,7 +178,7 @@ public class NonBlockingPipedInputStream extends InputStream {
 
             toCopy = Math.min(remaining, write.end - write.cur);
 
-            System.arraycopy(buffer, offset, buf, write.cur, toCopy);
+            System.arraycopy(buffer, offset, bufRef, write.cur, toCopy);
 
             write.cur += toCopy;
 
@@ -214,6 +231,8 @@ public class NonBlockingPipedInputStream extends InputStream {
 
     private static final class Pipe {
 
+        private final NonBlockingPipedInputStream inputStream;
+
         private final Pipe opposite;
 
         private final Semaphore sync = new Semaphore(0);
@@ -222,7 +241,7 @@ public class NonBlockingPipedInputStream extends InputStream {
         private volatile boolean closed = false;
 
         //we exploit the fact that we only have 2 pipes from 2 threads to implement a "pipe" without
-        //any blocking and without compare-and-swap. In fact, spaceEnd probably doesn't even need to be volatile
+        //any blocking and without compare-and-swap.
 
         private final long lengthLong;
         private final int length;
@@ -234,15 +253,20 @@ public class NonBlockingPipedInputStream extends InputStream {
         //spaceEnd is incremented by one thread when space becomes available and spaceStart lags behind indicating to
         //the opposite thread that space is available
         private long spaceStart = 0;
-        private volatile long spaceEnd = 0;
+
+        private AtomicLong spaceEnd = new AtomicLong(0);
+        //what opposite.spaceEnd "should be", since we us lazySet, even the current thread might not get the same value immediately after lazySet
+        private long oppositeSpaceEnd;
 
 
-        private Pipe(final int length) {
+        private Pipe(final int length, NonBlockingPipedInputStream inputStream) {
+            this.inputStream = inputStream;
             this.length = length;
             this.lengthLong = length;
-            this.opposite = new Pipe(this, length);
+            this.opposite = new Pipe(this, length, inputStream);
         }
-        private Pipe(final Pipe opposite, final int length) {
+        private Pipe(final Pipe opposite, final int length, NonBlockingPipedInputStream inputStream) {
+            this.inputStream = inputStream;
             this.opposite = opposite;
             this.length = length;
             this.lengthLong = length;
@@ -251,7 +275,7 @@ public class NonBlockingPipedInputStream extends InputStream {
 
         private boolean fetch() throws IOException {
 
-            if (spaceStart == spaceEnd) {
+            if (spaceStart == spaceEnd.get()) {
                 if (cur != end) {
                     start = cur;
                     return true;
@@ -259,12 +283,12 @@ public class NonBlockingPipedInputStream extends InputStream {
                 do {
                     try {
                         blocking = true;
-                        if (spaceStart != spaceEnd) {
+                        if (spaceStart != spaceEnd.get()) {
                             break;
                         }
                         if (closed || opposite.closed) {
                             //needed because we might get written to between the check above and checking the closed flags
-                            if (spaceStart != spaceEnd) {
+                            if (spaceStart != spaceEnd.get()) {
                                 break;
                             }
                             return false;
@@ -275,7 +299,7 @@ public class NonBlockingPipedInputStream extends InputStream {
                     } finally {
                         blocking = false;
                     }
-                } while (spaceStart == spaceEnd);
+                } while (spaceStart == spaceEnd.get());
             }
 
             if (cur == length) {
@@ -288,7 +312,7 @@ public class NonBlockingPipedInputStream extends InputStream {
             //ie spaceEnd will be close to Long.MIN_VALUE and spaceStart will be close to Long.MAX_VALUE, subtracting Long.MAX_VALUE from Long.MIN_VALUE causes reverse-overflow back to the correct answer.
             //ie the max amount of space available will never be greater than Integer.MAX_VALUE
             //and (Long.MIN_VALUE + ((long) Integer.MAX_VALUE)) - Long.MAX_VALUE == ((long) Integer.MAX_VALUE)+ 1L, which is the correct answer
-            long space = spaceEnd - spaceStart;
+            long space = spaceEnd.get() - spaceStart;
 
             if (((long) end) + space > lengthLong) {
                 space = length - end;
@@ -302,8 +326,14 @@ public class NonBlockingPipedInputStream extends InputStream {
 
         private void finish() {
 
-            //normally, incrementing a volatile field will not work, you need a compare-and-swap, but since only one thread is writing, this is fine
-            opposite.spaceEnd = opposite.spaceEnd + (cur - start);
+            //force updated buf contents to be visible in other thread, while this may not seem necessary and I can run a whole bunch of testing that shows it's not needed,
+            //the JLS non-the-less says that it is possible for updates to the buffer's contents to not be visible in the other thread without this
+            inputStream.buf = inputStream.bufRef2;
+
+            //use lazySet because this is actually the only thread updating the value, but we need an "atomic" long write that eventually will become visible in the other thread
+            //ie the JLS says that non-volatile writes to long fields must be treated as two non-atomic writes
+            oppositeSpaceEnd += cur - start;
+            opposite.spaceEnd.lazySet(oppositeSpaceEnd);
 
             //since we always add to the queue before we get here and fetch() always re-checks the queue, this will work fine
             if (opposite.blocking) {
@@ -327,46 +357,26 @@ public class NonBlockingPipedInputStream extends InputStream {
 
 
 
-    public static long speedTest(final InputStream input, final OutputStream out, final Random ra, final Random rb, final int iterations) throws Throwable {
+    static long speedTest(final InputStream input, final OutputStream out, final int iterations, final int bytesPerWrite, final int bytesPerRead) throws Throwable {
 
         final AtomicLong start = new AtomicLong();
         final AtomicLong end = new AtomicLong();
 
-        final CyclicBarrier barrier = new CyclicBarrier(2, new Runnable() {
-            @Override
-            public void run() {
-                start.set(System.nanoTime());
-            }
-        });
+        final CyclicBarrier barrier = new CyclicBarrier(2, () -> start.set(System.nanoTime()));
 
-        Thread writeThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    barrier.await();
-//                    byte[] buf = new byte[432];
+        Thread writeThread = new Thread(() -> {
+            try {
+                byte[] buf = new byte[bytesPerWrite];
 
-                    for (int y = 0; y < iterations; ++y) {
-                        if (ra.nextBoolean()) {
-                            byte[] buf = new byte[ra.nextInt(1000) + 1];
-//                            ra.nextBytes(buf);
-                            if (ra.nextBoolean()) {
-                                out.write(buf);
-                            } else {
-                                int off = ra.nextInt(buf.length);
-                                int len = ra.nextInt(buf.length - off);
-                                out.write(buf, off, len);
-                            }
-                        } else {
-                            int i = ra.nextInt();
-                            out.write(i);
-                        }
-                    }
+                barrier.await();
 
-                    out.close();
-                } catch (final Throwable t) {
-                    t.printStackTrace();
+                for (int y = 0; y < iterations; ++y) {
+                    out.write(buf, 0, bytesPerWrite);
                 }
+
+                out.close();
+            } catch (final Throwable t) {
+                t.printStackTrace();
             }
         }, "SpeedTestNonBlockingPipedInputStreamThread1");
 
@@ -374,39 +384,21 @@ public class NonBlockingPipedInputStream extends InputStream {
         writeThread.setPriority(Thread.MAX_PRIORITY);
 
 
-        Thread readThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                try {
-                    barrier.await();
-                    byte[] buf = new byte[1000];
-                    while(true) {
-//                        if (rb.nextBoolean()) {
-//                            byte[] buf = new byte[1000];
-                            int read;
-
-//                            if (rb.nextBoolean()) {
-                                read = input.read(buf);
-//                            } else {
-//                                int off = rb.nextInt(buf.length);
-//                                read = input.read(buf, off, rb.nextInt(buf.length - off));
-//                            }
-
-                            if (read < 0) {
-                                break;
-                            }
-//
-//                        } else {
-//                            if (input.read() < 0) {
-//                                break;
-//                            }
-//                        }
+        Thread readThread = new Thread(() -> {
+            try {
+                byte[] buf = new byte[bytesPerRead];
+                int read;
+                barrier.await();
+                while(true) {
+                    read = input.read(buf);
+                    if (read < 0) {
+                        break;
                     }
-
-                    end.set(System.nanoTime());
-                } catch (final Throwable t) {
-                    t.printStackTrace();
                 }
+
+                end.set(System.nanoTime());
+            } catch (final Throwable t) {
+                t.printStackTrace();
             }
         }, "SpeedTestNonBlockingPipedInputStreamThread2");
 
@@ -420,5 +412,69 @@ public class NonBlockingPipedInputStream extends InputStream {
         writeThread.join();
 
         return end.get() - start.get();
+    }
+
+
+
+    static void checkConsistency(final InputStream input, final OutputStream out, final int iterations, final int bytesPerWrite, final int bytesPerRead) throws Throwable {
+
+        final CyclicBarrier barrier = new CyclicBarrier(2);
+
+        Thread writeThread = new Thread(() -> {
+            try {
+                byte counter = 0;
+                byte[] buf = new byte[bytesPerWrite];
+                int x;
+
+                barrier.await();
+                for (int y = 0; y < iterations; ++y) {
+                    for (x = 0; x < bytesPerWrite; ++x) {
+                        buf[x] = ++counter;
+                    }
+                    out.write(buf, 0, bytesPerWrite);
+                }
+
+                out.close();
+            } catch (final Throwable t) {
+                t.printStackTrace();
+            }
+        }, "CheckConsistencyNonBlockingPipedInputStreamThread1");
+
+        writeThread.setDaemon(true);
+        writeThread.setPriority(Thread.MAX_PRIORITY);
+
+
+        Thread readThread = new Thread(() -> {
+            try {
+                byte counter = 0;
+                byte[] buf = new byte[bytesPerRead];
+                int x, read;
+
+                barrier.await();
+                while(true) {
+                    read = input.read(buf);
+                    if (read < 0) {
+                        break;
+                    }
+                    for (x = 0; x < read; ++x) {
+                        if (buf[x] != ++counter) {
+                            throw new IllegalStateException("got wrong value!");
+                        }
+                    }
+                }
+
+            } catch (final Throwable t) {
+                t.printStackTrace();
+            }
+        }, "CheckConsistencyNonBlockingPipedInputStreamThread2");
+
+        readThread.setDaemon(true);
+        readThread.setPriority(Thread.MAX_PRIORITY);
+
+        readThread.start();
+        writeThread.start();
+
+        readThread.join();
+        writeThread.join();
     }
 }
